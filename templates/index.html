@@ -89,6 +89,17 @@
     <ol class="log" id="log-ckpt"></ol>
   </section>
 
+  <section class="timeline" id="timeline">
+    <h2>提交时间线（按实际提交顺序，从 1 编号）</h2>
+    <p class="timeline-hint">仅收录<b>至少一次「加上」成功且 COMMIT 成功</b>的事务：
+       栏位、首次成功加法前的值、提交后的值与按执行顺序排列的成功增量。
+       失败加法不计入；回滚、失败提交、纯读事务不产生记录；未提交内容不可见；
+       提交重试成功只记一次。采集、查询与轮询都不在两栏连接上额外读值、
+       不提前建立读快照，也不改变最近一次显式读值；时间线只保存在内存中，
+       也可 HTTP 查询 <code>GET /api/experiments/&lt;id&gt;/timeline</code>。</p>
+    <ol class="log" id="log-timeline"></ol>
+  </section>
+
   <footer>
     <p>说明：状态刷新不执行任何 SELECT，不会为 DEFERRED 事务提前建立快照，也不触发检查点
        （检查点结果只读内存缓存）；写锁冲突会立即返回

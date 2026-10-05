@@ -34,6 +34,16 @@ WAL 检查点（PASSIVE / TRUNCATE）不由甲、乙两栏的连接执行，而�
 数据库及 -wal、-shm 文件——此时不存在在途请求或在途检查点连接，
 检查点不可能在删除后重新创建文件。本次运行中已删除 ID 仍返回 410，
 未知 ID 返回 404。
+
+提交时间线（GET /api/experiments/<id>/timeline，并随 /status 返回）：
+每个实验的记录按实际提交顺序从 1 编号，仅收录「至少一次加法成功且
+COMMIT 成功」的事务——栏位、首次成功加法前的值、提交后的值与按执行
+顺序排列的成功增量。失败加法不计入；回滚、失败提交、纯读事务不产生
+记录；未提交内容不可见；提交重试成功只记一次。记录值取自本事务写入时
+UPDATE 内 checked_add 的暂存（SQLite 求值时给出的行值），绝不在提交后
+再读任何连接，因此采集、查询与轮询都不在两栏连接上额外读值、不提前
+建立读快照，也不改变最近一次显式读值。时间线只保存在内存中，无需
+跨重启保留。
 """
 
 import os
@@ -126,9 +136,29 @@ class Experiment:
         # overflow_flags 供连接上的 checked_add 函数在判定 64 位溢出时置位，
         # 以便把溢出与普通 SQLite 错误区分开，沿用既有的拒绝响应。
         self.overflow_flags = {"a": [False], "b": [False]}
+        # 提交时间线的采集暂存（仅内存，随连接锁保护）：
+        # pending_adds 是 checked_add 在 UPDATE 语句内被求值时写下的
+        # (加法前的值, 增量, 加法后的值)，语句整体失败即丢弃（失败加法
+        # 不计入），语句成功才并入 tx_track；tx_track 汇总本事务的
+        # 首次成功加法前的值、按执行顺序排列的成功增量与最近结果值。
+        # 这些值全部由 SQLite 在语句求值时给出，采集不在两栏连接上
+        # 执行任何额外 SELECT，也不会提前建立读快照。
+        self.pending_adds = {"a": [], "b": []}
+        self.tx_track = {
+            "a": {"base": None, "deltas": [], "last": None},
+            "b": {"base": None, "deltas": [], "last": None},
+        }
         self.conns = {
-            "a": self._open_conn(self.overflow_flags["a"], autockpt=False),
-            "b": self._open_conn(self.overflow_flags["b"], autockpt=False),
+            "a": self._open_conn(
+                self.overflow_flags["a"],
+                autockpt=False,
+                pending_adds=self.pending_adds["a"],
+            ),
+            "b": self._open_conn(
+                self.overflow_flags["b"],
+                autockpt=False,
+                pending_adds=self.pending_adds["b"],
+            ),
         }
         self.conn_locks = {"a": threading.Lock(), "b": threading.Lock()}
         # 第三条连接：只读已提交值
@@ -139,6 +169,12 @@ class Experiment:
         self.checkpoint_lock = threading.Lock()
         self.checkpoint_last = None
         self.checkpoint_log = []
+        # 提交时间线：只保存在内存（无需跨重启保留）。每条记录对应一个
+        # 「至少一次成功加法且 COMMIT 成功」的事务，按实际提交顺序从 1
+        # 编号。timeline_lock 横跨 COMMIT 执行与记录追加，保证记录顺序
+        # 与实际提交顺序一致；查询只读这份内存记录，不执行任何 SQL。
+        self.timeline = []
+        self.timeline_lock = threading.Lock()
         # 删除准入控制：gate 同时保护 active_calls / deleting / deleted。
         # 删除开始时先置 deleting 并等待已准入请求（active_calls）全部完成，
         # 此后新请求一律 410；拆除连接与文件期间不可能有请求触碰它们。
@@ -161,7 +197,7 @@ class Experiment:
         finally:
             conn.close()
 
-    def _open_conn(self, overflow_flag=None, autockpt=True):
+    def _open_conn(self, overflow_flag=None, autockpt=True, pending_adds=None):
         conn = sqlite3.connect(
             self.db_path, timeout=0, isolation_level=None, check_same_thread=False
         )
@@ -181,6 +217,12 @@ class Experiment:
                 if not INT64_MIN <= result <= INT64_MAX:
                     overflow_flag[0] = True
                     raise OverflowError("累加结果超出有符号 64 位整数范围")
+                if pending_adds is not None:
+                    # 为提交时间线暂存本次计算：current / result 都是 SQLite
+                    # 求值 UPDATE 时给出的行值，不在本连接上额外读值。
+                    # 这只是暂存——语句整体失败（写锁冲突、只读、溢出等）
+                    # 时由调用方丢弃，语句成功才并入本事务的成功增量。
+                    pending_adds.append((current, delta, result))
                 return result
 
             conn.create_function("checked_add", 2, checked_add)
@@ -207,6 +249,21 @@ class Experiment:
     def checkpoint_state(self):
         # 只读内存缓存：不执行任何 SQL、不触发检查点
         return {"last": self.checkpoint_last, "log": list(self.checkpoint_log)}
+
+    def timeline_state(self):
+        # 只读内存中的提交时间线：不执行任何 SQL、不在两栏连接上读值、
+        # 不建立读快照，也不改变最近一次显式读值。整数沿用无损编码约定。
+        with self.timeline_lock:
+            return [
+                {
+                    "seq": rec["seq"],
+                    "side": rec["side"],
+                    "before": json_int(rec["before"]),
+                    "after": json_int(rec["after"]),
+                    "deltas": [json_int(delta) for delta in rec["deltas"]],
+                }
+                for rec in self.timeline
+            ]
 
     def add_checkpoint_log(self, text):
         self.checkpoint_log.append("%s  %s" % (time.strftime("%H:%M:%S"), text))
@@ -359,22 +416,66 @@ def run_op(exp, side, op, value):
                 # 纯写语句在写锁被占时返回 SQLITE_BUSY 且不建立读快照，
                 # 因此对方提交/回滚释放写锁后可在同一事务直接重试成功。
                 exp.overflow_flags[side][0] = False
-                conn.execute(
-                    "UPDATE kv SET val = checked_add(val, ?) WHERE id = 1",
-                    (value,),
-                )
+                pending = exp.pending_adds[side]
+                del pending[:]
+                try:
+                    conn.execute(
+                        "UPDATE kv SET val = checked_add(val, ?) WHERE id = 1",
+                        (value,),
+                    )
+                except sqlite3.Error:
+                    # 语句失败（写锁冲突 / 只读 / 溢出等）：失败加法不计入，
+                    # 丢弃 checked_add 在语句内的暂存，本事务既有暂存不动。
+                    del pending[:]
+                    raise
+                # 语句成功：暂存并入本事务的时间线暂存——首次成功加法记下
+                # 加法前的值，成功增量按执行顺序排列，最近结果即提交后的值。
+                track = exp.tx_track[side]
+                for current, delta, result in pending:
+                    if not track["deltas"]:
+                        track["base"] = current
+                    track["deltas"].append(delta)
+                    track["last"] = result
+                del pending[:]
                 panel.tx_has_snapshot = True
                 panel.add_log("加上 %s → 成功（尚未提交）" % value)
             elif op == "commit":
                 if not conn.in_transaction:
                     return reject("当前没有开启的事务")
-                conn.execute("COMMIT")
+                # timeline_lock 横跨 COMMIT 与记录追加：记录顺序即实际
+                # 提交顺序。COMMIT 非阻塞（busy_timeout=0），且本锁不嵌套
+                # 其它资源锁，不会形成等待环。
+                with exp.timeline_lock:
+                    conn.execute("COMMIT")
+                    track = exp.tx_track[side]
+                    if track["deltas"]:
+                        # 至少一次成功加法且 COMMIT 成功才产生一条记录；
+                        # 提交重试成功也只在这里记一次。值取自本事务写入时
+                        # checked_add 的暂存，绝不在提交后再读任何连接
+                        # （不读别栏新值、不建立快照、不改最近显式读值）。
+                        exp.timeline.append(
+                            {
+                                "seq": len(exp.timeline) + 1,
+                                "side": side,
+                                "before": track["base"],
+                                "after": track["last"],
+                                "deltas": list(track["deltas"]),
+                            }
+                        )
+                    track["base"] = None
+                    track["deltas"] = []
+                    track["last"] = None
                 panel.tx_has_snapshot = False
                 panel.add_log("COMMIT → 成功，事务已提交")
             elif op == "rollback":
                 if not conn.in_transaction:
                     return reject("当前没有开启的事务")
                 conn.execute("ROLLBACK")
+                # 回滚不产生记录：丢弃本事务的时间线暂存
+                track = exp.tx_track[side]
+                track["base"] = None
+                track["deltas"] = []
+                track["last"] = None
                 panel.tx_has_snapshot = False
                 panel.add_log("ROLLBACK → 成功，事务已回滚")
             else:
@@ -577,15 +678,29 @@ def experiment_status(exp_id):
     if exp is None:
         return response
     try:
-        # 两栏状态与检查点状态均来自内存缓存，不执行任何 SQL、不触发检查点
+        # 两栏状态、检查点状态与提交时间线均来自内存缓存，
+        # 不执行任何 SQL、不触发检查点、不在两栏连接上读值
         return jsonify(
             {
                 "id": exp.id,
                 "a": exp.panel_state("a"),
                 "b": exp.panel_state("b"),
                 "checkpoint": exp.checkpoint_state(),
+                "timeline": exp.timeline_state(),
             }
         )
+    finally:
+        exp.finish_call()
+
+
+@app.get("/api/experiments/<exp_id>/timeline")
+def experiment_timeline(exp_id):
+    exp, response = admit_experiment(exp_id)
+    if exp is None:
+        return response
+    try:
+        # 提交时间线只读内存记录：不在两栏连接上额外读值、不建立读快照
+        return jsonify({"timeline": exp.timeline_state()})
     finally:
         exp.finish_call()
 

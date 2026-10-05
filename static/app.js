@@ -17,6 +17,8 @@ let committedTimer = null;
 // 保证同一时刻只会新建一个实验
 let creatingPromise = null;
 const lastRender = { a: "", b: "" };
+// 提交时间线的渲染去重键：与 lastRender 同理，内容不变就不重绘
+let lastTimelineRender = "";
 // 最近一次被服务端确认的只读模式（初始 / 新建后为 false）。开关请求失败时
 // 复选框与文案一律恢复到它：请求期间轮询若已带回新确认，就恢复成新值；
 // 期间没有任何新确认，则恢复点击前的旧模式。乐观渲染只改 DOM，不动这里。
@@ -70,6 +72,7 @@ function freezeExperiment(reason) {
   $("panel-a").classList.add("exp-frozen");
   $("panel-b").classList.add("exp-frozen");
   $("checkpoint").classList.add("exp-frozen");
+  $("timeline").classList.add("exp-frozen");
   const note = $("deleted-note");
   note.textContent = reason;
   note.hidden = false;
@@ -100,6 +103,7 @@ async function createExperiment() {
   $("panel-a").classList.remove("exp-frozen");
   $("panel-b").classList.remove("exp-frozen");
   $("checkpoint").classList.remove("exp-frozen");
+  $("timeline").classList.remove("exp-frozen");
   setBusy("a", true);
   setBusy("b", true);
   setCheckpointBusy(true);
@@ -177,6 +181,8 @@ async function createExperiment() {
     $(`log-${side}`).innerHTML = "";
     clearError(side);
   }
+  lastTimelineRender = "";
+  $("log-timeline").innerHTML = "";
   $("ckpt-result").textContent = "尚未执行过检查点";
   $("ckpt-result").classList.remove("busy");
   $("log-ckpt").innerHTML = "";
@@ -224,6 +230,7 @@ async function refreshStatus(gen, opts = {}) {
     renderPanel("a", data.a);
     renderPanel("b", data.b);
     renderCheckpoint(data.checkpoint);
+    renderTimeline(data.timeline);
   } catch (e) {
     if (e instanceof ExpDeleted) {
       if (gen === expGen) {
@@ -333,6 +340,28 @@ function renderCheckpoint(state) {
     if (entry.includes("失败") || entry.includes("busy=1")) {
       li.classList.add("log-error");
     }
+    logEl.appendChild(li);
+  }
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+function renderTimeline(list) {
+  // 提交时间线来自服务端内存记录：渲染本身不读值、不建立快照。
+  // 记录按实际提交顺序从 1 编号，旧实验的迟到响应在调用前已被
+  // 代数（expGen）检查拦截，不会覆盖新实验的时间线。
+  const records = list || [];
+  const key = JSON.stringify(records);
+  if (lastTimelineRender === key) return;
+  lastTimelineRender = key;
+
+  const logEl = $("log-timeline");
+  logEl.innerHTML = "";
+  for (const rec of records) {
+    const li = document.createElement("li");
+    const side = rec.side === "a" ? "甲" : rec.side === "b" ? "乙" : rec.side;
+    li.textContent =
+      `#${rec.seq} ${side}：${rec.before} → ${rec.after}，` +
+      `增量 [${rec.deltas.join(", ")}]`;
     logEl.appendChild(li);
   }
   logEl.scrollTop = logEl.scrollHeight;

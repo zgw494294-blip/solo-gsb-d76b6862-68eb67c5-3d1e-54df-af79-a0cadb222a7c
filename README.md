@@ -46,6 +46,15 @@
 - 本次运行中，已删除 ID 再次删除（或调用任何该实验接口）仍返回 **410**；
   未知 ID 返回 **404**。页面收到删除成功或 410 后停止轮询、禁用旧实验的全部操作，
   迟到响应不会恢复旧展示也不会自动新建实验；「新建实验」始终可手动使用
+- 页面底部展示**提交时间线**（也可 HTTP 查询 `GET /api/experiments/<id>/timeline`，
+  并随 `/status` 返回）：每个实验的记录按实际提交顺序从 1 编号，仅收录
+  **至少一次「加上」成功且 COMMIT 成功**的事务——栏位、首次成功加法前的值、
+  提交后的值与按执行顺序排列的成功增量；失败加法不计入，回滚、失败提交、
+  纯读事务不产生记录，未提交内容不可见，提交重试成功只记一次。记录值取自
+  本事务写入时 `UPDATE` 内 `checked_add` 的暂存（SQLite 求值时给出的行值），
+  绝不在提交后再读任何连接，因此采集、查询与轮询都不在两栏连接上额外读值、
+  不提前建立读快照，也不改变最近一次显式读值；时间线只保存在内存中，
+  无需跨重启保留
 - 手动「新建实验」进行期间：**立即暂停旧实验的两组轮询并保持旧实验全部操作禁用**
   （`creating` 同时拦截已入队、尚未执行的迟到轮询回调），创建成功前不会再有任何
   请求发往旧 ID；创建成功后只为**新 ID** 启用控件并启动轮询。旧实验的轮询、
@@ -166,6 +175,24 @@ node tests/readonly.test.js
 存活页新建失败恢复旧实验、404 自动新建且并发只建一次、410 冻结不自动新建；
 只读开关的「轮询先确认 → 请求失败」交错回退、无新确认回退原模式、相同状态
 轮询纠正本地偏差。
+
+`tests/timeline.test.js` 覆盖提交时间线的前端渲染：状态轮询中的 `timeline`
+字段渲染到底部列表（栏位、前后值、增量）、新记录按提交顺序追加、大整数字符串
+原样显示、新建实验清空、旧实验迟到响应不覆盖新实验时间线、410 冻结：
+
+```bash
+node tests/timeline.test.js
+```
+
+`tests/timeline.test.py` 用 Flask 测试客户端驱动真实 SQLite 验证时间线语义：
+按实际提交顺序从 1 编号、栏位 / 首次成功加法前的值 / 提交后的值 / 按执行顺序
+排列的成功增量、失败加法不计入（写锁冲突 / 溢出 / 只读拒绝）、回滚与纯读事务
+不记录、未提交内容不可见、提交重试成功只记一次、大整数无损编码、
+`/status` 携带时间线且不改变最近显式读值、删除后 410 与未知 ID 404：
+
+```bash
+python3 tests/timeline.test.py
+```
 
 ## 操作示例
 
@@ -293,7 +320,6 @@ curl -s http://localhost:8000/api/experiments/$EXP/status
 > 的后续轮询也会纠正本地偏差，无须等日志或读值变化。详见上文
 > 「前端交错问题的复现」第 3 类。
 
-
 ### 示例三：大整数精度（9007199254741093）
 
 1. 甲：`BEGIN DEFERRED` → 输入 `9007199254740993`（超出 JavaScript 安全整数范围，
@@ -372,6 +398,71 @@ curl -s -X POST http://localhost:8000/api/experiments/$EXP/conn/b/op \
 curl -s -X POST http://localhost:8000/api/experiments/$EXP/conn/a/op \
   -H 'Content-Type: application/json' -d '{"op":"rollback"}'
 ```
+
+### 示例六：提交时间线（按事务汇总，按实际提交顺序编号）
+
+> 时间线只收录**至少一次「加上」成功且 COMMIT 成功**的事务：栏位、首次成功
+> 加法前的值、提交后的值、按执行顺序排列的成功增量。失败加法（写锁冲突、
+> 溢出、只读拒绝等）不计入；回滚、失败提交、纯读事务不产生记录；未提交内容
+> 不可见；提交重试成功只记一次。页面底部随状态轮询自动刷新，HTTP 可查询
+> `GET /api/experiments/<id>/timeline`（`/status` 响应中也带 `timeline` 字段）。
+
+1. 甲：`BEGIN DEFERRED` → 输入 `5` → `加上` → 输入 `7` → `加上`（先不提交）
+2. 乙：`BEGIN DEFERRED`（不显式读值）→ 输入 `3` → `加上` →
+   立即报错 **SQLITE_BUSY（错误码 5）**（失败加法不计入时间线）
+3. 甲：`提交` → 时间线出现第一条记录：`#1 甲：100 → 112，增量 [5, 7]`
+4. 乙：**在原事务中**再次输入 `3` → `加上` → 成功 → `提交` →
+   时间线追加第二条记录：`#2 乙：112 → 115，增量 [3]`
+
+#### HTTP 调用示例
+
+```bash
+EXP=<新建实验返回的 id>
+
+# 甲：BEGIN → +5 → +7（先不提交）
+curl -s -X POST http://localhost:8000/api/experiments/$EXP/conn/a/op \
+  -H 'Content-Type: application/json' -d '{"op":"begin"}'
+curl -s -X POST http://localhost:8000/api/experiments/$EXP/conn/a/op \
+  -H 'Content-Type: application/json' -d '{"op":"add","value":5}'
+curl -s -X POST http://localhost:8000/api/experiments/$EXP/conn/a/op \
+  -H 'Content-Type: application/json' -d '{"op":"add","value":7}'
+
+# 乙：BEGIN → +3 → 写锁冲突（SQLITE_BUSY(5)，失败加法不计入）
+curl -s -X POST http://localhost:8000/api/experiments/$EXP/conn/b/op \
+  -H 'Content-Type: application/json' -d '{"op":"begin"}'
+curl -s -X POST http://localhost:8000/api/experiments/$EXP/conn/b/op \
+  -H 'Content-Type: application/json' -d '{"op":"add","value":3}'
+
+# 未提交内容不可见：此时时间线仍为空
+curl -s http://localhost:8000/api/experiments/$EXP/timeline
+# {"timeline":[]}
+
+# 甲提交：出现第一条记录 100→112、[5,7]
+curl -s -X POST http://localhost:8000/api/experiments/$EXP/conn/a/op \
+  -H 'Content-Type: application/json' -d '{"op":"commit"}'
+curl -s http://localhost:8000/api/experiments/$EXP/timeline
+# {"timeline":[{"seq":1,"side":"a","before":100,"after":112,"deltas":[5,7]}]}
+
+# 乙在原事务重试 +3 并提交：追加第二条记录 112→115、[3]
+curl -s -X POST http://localhost:8000/api/experiments/$EXP/conn/b/op \
+  -H 'Content-Type: application/json' -d '{"op":"add","value":3}'
+curl -s -X POST http://localhost:8000/api/experiments/$EXP/conn/b/op \
+  -H 'Content-Type: application/json' -d '{"op":"commit"}'
+curl -s http://localhost:8000/api/experiments/$EXP/timeline
+# {"timeline":[
+#   {"seq":1,"side":"a","before":100,"after":112,"deltas":[5,7]},
+#   {"seq":2,"side":"b","before":112,"after":115,"deltas":[3]}]}
+
+# 时间线也随状态接口返回（只读内存记录，不执行任何 SQL）
+curl -s http://localhost:8000/api/experiments/$EXP/status
+# {"id":"...","a":{...},"b":{...},"checkpoint":{...},
+#  "timeline":[{"seq":1,...},{"seq":2,...}]}
+```
+
+> 记录中的整数沿用无损编码约定：超出 ±2⁵³−1 的 `before` / `after` / `deltas`
+> 元素以十进制字符串传输，范围内仍为 JSON 数字。回滚的事务、纯读事务、
+> 失败的加法与失败的提交都不会留下记录；删除实验后该接口同样返回 **410**，
+> 未知 ID 返回 **404**。
 
 删除实验使用 `DELETE` 方法（页面上对应「删除当前实验」按钮，点击后需二次确认）：
 
