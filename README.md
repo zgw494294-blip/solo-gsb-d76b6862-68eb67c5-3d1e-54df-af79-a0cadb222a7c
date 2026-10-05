@@ -38,6 +38,17 @@
 - 检查点结果显示模式与 SQLite 原始三项（**busy、WAL 总帧数、已回写帧数**）及
   操作后 WAL 文件字节数（文件不存在记 0）；状态刷新只读内存缓存，不触发检查点
 - 检查点不代替两栏提交 / 回滚，也不替换任何连接
+- **提交时间线**（页面底部区块、`GET /api/experiments/<id>/timeline`，同时随
+  `/status` 的 `timeline` 字段返回）：按事务汇总，按实际提交顺序从 1 编号。
+  仅「至少一次加法成功且 COMMIT 成功」的事务产生一条记录，含栏位、首次成功
+  加法前的值、提交后的值与按执行顺序排列的成功增量（沿用整数无损约定，大整数
+  用十进制字符串）。失败加法不计入；回滚、失败提交与纯读事务不记录；未提交
+  内容不可见；提交重试成功只记一次。首次成功加法前的值由 `UPDATE` 内的
+  `checked_add` 在语句执行时捕获（事务自身视图），提交后的值 = 该值 + 全部
+  成功增量之和，绝不事后读取别栏新值作为本次结果；采集、查询与轮询都不在
+  两栏连接上额外读值、不提前建立快照，也不改变最近一次显式读值；`COMMIT`
+  与记录追加在同一临界区完成，编号顺序与实际提交顺序严格一致；时间线只
+  保存在内存，无需跨重启保留
 - 页面提供**删除当前实验**按钮（也可 HTTP 调用）：确认后删除。删除开始即等待
   此前已进入的请求正常完成，期间该实验的操作、状态、已提交值与检查点**新请求
   一律返回 410 Gone**；等待按实验独立，不阻塞其他实验。随后回滚两栏未提交事务、
@@ -397,6 +408,73 @@ curl -s -o /dev/null -w "%{http_code}\n" -X DELETE \
 > 已进入的请求正常完成；删除不会阻塞其他实验，未删除实验的甲、乙两栏仍可独立操作。
 > 页面收到删除成功或 410 后停止轮询并禁用旧实验操作，迟到响应不会恢复旧展示，
 > 也不会自动新建实验；需要时点击「新建实验」即可。
+
+### 示例六：提交时间线（按事务汇总，按实际提交顺序编号）
+
+> 仅「至少一次加法成功且 **COMMIT 成功**」的事务产生一条记录：栏位、首次成功
+> 加法前的值、提交后的值与按执行顺序排列的成功增量。失败加法不计入；回滚、
+> 失败提交与纯读事务不记录；未提交内容不可见；提交重试成功只记一次。
+> 页面底部区块随状态轮询自动刷新，也可通过 HTTP 直接查询。
+
+1. 甲：`BEGIN DEFERRED` → 输入 `5` → `加上` → 输入 `7` → `加上`（先不提交，
+   甲持有写锁）
+2. 乙：`BEGIN DEFERRED`（不显式读值）→ 输入 `3` → `加上` →
+   立即报错 **SQLITE_BUSY（错误码 5）**——失败加法**不计入**时间线，
+   乙的事务不会被自动结束
+3. 甲：`提交` → 时间线出现第 1 条：**#1 甲（A） 100 → 112 增量 [5, 7]**
+4. 乙：**在原事务中**再次输入 `3` → `加上` → 成功 → `提交` →
+   时间线追加第 2 条：**#2 乙（B） 112 → 115 增量 [3]**
+   （「首次成功加法前的值」是乙重试时实际看到的 112，不是失败时的 100；
+   记录顺序与实际提交顺序一致）
+
+#### HTTP 调用示例
+
+```bash
+EXP=<新建实验返回的 id>
+
+# 甲：事务内 +5、+7（先不提交）
+curl -s -X POST http://localhost:8000/api/experiments/$EXP/conn/a/op \
+  -H 'Content-Type: application/json' -d '{"op":"begin"}'
+curl -s -X POST http://localhost:8000/api/experiments/$EXP/conn/a/op \
+  -H 'Content-Type: application/json' -d '{"op":"add","value":5}'
+curl -s -X POST http://localhost:8000/api/experiments/$EXP/conn/a/op \
+  -H 'Content-Type: application/json' -d '{"op":"add","value":7}'
+
+# 乙：甲未提交时加法撞写锁（失败加法不计入时间线）
+curl -s -X POST http://localhost:8000/api/experiments/$EXP/conn/b/op \
+  -H 'Content-Type: application/json' -d '{"op":"begin"}'
+curl -s -X POST http://localhost:8000/api/experiments/$EXP/conn/b/op \
+  -H 'Content-Type: application/json' -d '{"op":"add","value":3}'
+# {"ok":false,"error":{"name":"SQLITE_BUSY","code":5,...},...}
+
+# 甲提交：时间线出现第 1 条
+curl -s -X POST http://localhost:8000/api/experiments/$EXP/conn/a/op \
+  -H 'Content-Type: application/json' -d '{"op":"commit"}'
+
+# 乙在原事务重试 +3 并提交：时间线追加第 2 条
+curl -s -X POST http://localhost:8000/api/experiments/$EXP/conn/b/op \
+  -H 'Content-Type: application/json' -d '{"op":"add","value":3}'
+curl -s -X POST http://localhost:8000/api/experiments/$EXP/conn/b/op \
+  -H 'Content-Type: application/json' -d '{"op":"commit"}'
+
+# 查询提交时间线（只读内存，不在两栏连接上读值）
+curl -s http://localhost:8000/api/experiments/$EXP/timeline
+# {"timeline":[
+#   {"seq":1,"side":"a","before":100,"after":112,"deltas":[5,7]},
+#   {"seq":2,"side":"b","before":112,"after":115,"deltas":[3]}]}
+
+# 同一时间线也随状态接口返回（轮询不执行任何 SQL）
+curl -s http://localhost:8000/api/experiments/$EXP/status
+# {"id":"...","a":{...},"b":{...},"checkpoint":{...},
+#  "timeline":[{"seq":1,"side":"a","before":100,"after":112,"deltas":[5,7]},
+#              {"seq":2,"side":"b","before":112,"after":115,"deltas":[3]}]}
+```
+
+> 不产生记录的情形：事务只有读值（纯读事务）、加法全部失败（如 SQLITE_BUSY /
+> SQLITE_READONLY / 越界拒绝）、`回滚` 收尾、`提交` 失败（重试成功才记录一次）。
+> 大整数同样无损：超出 ±2⁵³−1 的 `before` / `after` / `deltas` 以十进制字符串
+> 返回。时间线只保存在内存，随实验删除或重启消失，无需跨重启保留。
+
 
 > 提示：一栏的请求未完成时，该栏按钮会被禁用，另一栏仍可正常操作；
 > 两栏的状态轮询与「已提交值」均通过独立连接 / 内存状态完成，

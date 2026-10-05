@@ -274,6 +274,37 @@ header button.danger:hover:not(:disabled) {
   min-height: 80px;
 }
 
+.timeline {
+  background: #fff;
+  border: 1px solid #e2e5ea;
+  border-radius: 8px;
+  margin: 0 20px 16px;
+  padding: 14px 16px;
+}
+
+.timeline h2 {
+  margin: 0 0 10px;
+  font-size: 16px;
+}
+
+.timeline-hint {
+  font-size: 12.5px;
+  color: #6b7280;
+  margin: 8px 0;
+  line-height: 1.7;
+}
+
+.timeline-log {
+  list-style: none;
+  padding-left: 8px;
+  max-height: 180px;
+  min-height: 60px;
+}
+
+.timeline-log li.timeline-empty {
+  color: #8b95a5;
+}
+
 footer {
   padding: 0 20px 16px;
   color: #6b7280;

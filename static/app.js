@@ -70,6 +70,7 @@ function freezeExperiment(reason) {
   $("panel-a").classList.add("exp-frozen");
   $("panel-b").classList.add("exp-frozen");
   $("checkpoint").classList.add("exp-frozen");
+  $("timeline").classList.add("exp-frozen");
   const note = $("deleted-note");
   note.textContent = reason;
   note.hidden = false;
@@ -100,6 +101,7 @@ async function createExperiment() {
   $("panel-a").classList.remove("exp-frozen");
   $("panel-b").classList.remove("exp-frozen");
   $("checkpoint").classList.remove("exp-frozen");
+  $("timeline").classList.remove("exp-frozen");
   setBusy("a", true);
   setBusy("b", true);
   setCheckpointBusy(true);
@@ -180,6 +182,7 @@ async function createExperiment() {
   $("ckpt-result").textContent = "尚未执行过检查点";
   $("ckpt-result").classList.remove("busy");
   $("log-ckpt").innerHTML = "";
+  $("timeline-list").innerHTML = "";
   clearError("ckpt");
   clearError("exp");
 
@@ -224,6 +227,7 @@ async function refreshStatus(gen, opts = {}) {
     renderPanel("a", data.a);
     renderPanel("b", data.b);
     renderCheckpoint(data.checkpoint);
+    renderTimeline(data.timeline);
   } catch (e) {
     if (e instanceof ExpDeleted) {
       if (gen === expGen) {
@@ -336,6 +340,31 @@ function renderCheckpoint(state) {
     logEl.appendChild(li);
   }
   logEl.scrollTop = logEl.scrollHeight;
+}
+
+const TIMELINE_SIDE_LABELS = { a: "甲（A）", b: "乙（B）" };
+
+function renderTimeline(records) {
+  // 只渲染服务端内存中的提交时间线：轮询本身不读库、不触碰两栏连接
+  const listEl = $("timeline-list");
+  listEl.innerHTML = "";
+  const items = Array.isArray(records) ? records : [];
+  if (items.length === 0) {
+    const li = document.createElement("li");
+    li.textContent = "暂无已提交的写入事务";
+    li.classList.add("timeline-empty");
+    listEl.appendChild(li);
+    return;
+  }
+  for (const rec of items) {
+    const li = document.createElement("li");
+    const side = TIMELINE_SIDE_LABELS[rec.side] || rec.side;
+    const deltas = (rec.deltas || []).join(", ");
+    li.textContent =
+      `#${rec.seq}  ${side}  ${rec.before} → ${rec.after}  增量 [${deltas}]`;
+    listEl.appendChild(li);
+  }
+  listEl.scrollTop = listEl.scrollHeight;
 }
 
 function setBusy(side, busy) {

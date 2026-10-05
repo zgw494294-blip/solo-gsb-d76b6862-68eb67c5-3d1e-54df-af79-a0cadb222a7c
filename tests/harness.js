@@ -126,6 +126,8 @@ function loadApp(search = "") {
     "error-ckpt",
     "ckpt-passive",
     "ckpt-truncate",
+    "timeline",
+    "timeline-list",
   ]) {
     get(id);
   }

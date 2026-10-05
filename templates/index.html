@@ -89,6 +89,16 @@
     <ol class="log" id="log-ckpt"></ol>
   </section>
 
+  <section class="timeline" id="timeline">
+    <h2>提交时间线（按事务汇总 · 按实际提交顺序从 1 编号）</h2>
+    <p class="timeline-hint">仅「至少一次加法成功且 COMMIT 成功」的事务产生一条记录：
+       栏位、首次成功加法前的值、提交后的值与按执行顺序排列的成功增量（整数无损）。
+       失败加法不计入；回滚、失败提交与纯读事务不记录；未提交内容不可见；
+       提交重试成功只记一次。记录来自事务执行期间的内存捕获，查询与轮询不在
+       两栏连接上额外读值、不提前建立快照；时间线只保存在内存，无需跨重启保留。</p>
+    <ol class="log timeline-log" id="timeline-list"></ol>
+  </section>
+
   <footer>
     <p>说明：状态刷新不执行任何 SELECT，不会为 DEFERRED 事务提前建立快照，也不触发检查点
        （检查点结果只读内存缓存）；写锁冲突会立即返回
